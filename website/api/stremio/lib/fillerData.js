@@ -143,9 +143,11 @@ async function fetchFillerData(animeName) {
   const showSlug = showList.__nameLookup?.[normalizeName(animeName)]
     || lookupBundle(showList, animeName);
   if (!showSlug) {
-    // Not an AFL anime → negative cache for 6h so we never check again
+    // Not an AFL anime → negative cache for 14 days so we never check again.
+    // showList.json is regenerated weekly and bundled at deploy time, so a
+    // newly-added anime will surface naturally on the next deploy.
     fillerCache.set(slug, { data: null, ts: Date.now() });
-    await kvSet(kvKey, "__null__", 60 * 60 * 6);
+    await kvSet(kvKey, "__null__", FILLER_KV_TTL);
     return null;
   }
 
@@ -336,10 +338,51 @@ function getFillerStats(episodes) {
   return stats;
 }
 
+/**
+ * Build the KV key used for filler lookups for a given slug.
+ * Exported so addon.js can include it in a batched MGET.
+ */
+function fillerKvKey(slug) {
+  return `afc:filler:${slug}`;
+}
+
+/**
+ * Prime the in-memory filler cache from a KV value fetched elsewhere
+ * (e.g. by addon.js's batched prefetch MGET). Accepts the raw KV value:
+ *   - object       → real filler data
+ *   - "__null__"   → negative cache marker
+ *   - null/undefined → no-op
+ * The subsequent fetchFillerData() call then hits the in-memory cache
+ * without issuing another KV command.
+ */
+function primeFillerCache(slug, kvValue) {
+  if (kvValue === undefined || kvValue === null) return;
+  if (kvValue === "__null__") {
+    fillerCache.set(slug, { data: null, ts: Date.now() });
+    return;
+  }
+  if (typeof kvValue === "object") {
+    fillerCache.set(slug, { data: kvValue, ts: Date.now() });
+  }
+}
+
+/**
+ * Returns true when the in-memory filler cache for `slug` is still within TTL.
+ * Lets addon.js skip the filler key in its batched MGET when no KV read is
+ * actually needed (hot-path requests on the same serverless instance).
+ */
+function hasFillerCacheFresh(slug) {
+  const cached = fillerCache.get(slug);
+  return !!(cached && Date.now() - cached.ts < CACHE_TTL);
+}
+
 module.exports = {
   buildSlug,
   fetchFillerData,
   fetchMALData,
   getFillerStats,
   similarity,
+  fillerKvKey,
+  primeFillerCache,
+  hasFillerCacheFresh,
 };

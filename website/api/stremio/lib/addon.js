@@ -8,9 +8,12 @@
 const { addonBuilder } = require("stremio-addon-sdk");
 const {
   fetchFillerData,
+  fillerKvKey,
+  primeFillerCache,
+  hasFillerCacheFresh,
 } = require("./fillerData");
 const { generateSubtitle, SHORT_LABELS } = require("./subtitles");
-const { kvGet, kvSet } = require("./kvCache");
+const { kvGet, kvMGet, kvSet } = require("./kvCache");
 
 // IMDB ID → AFL slug map (built by scrape-all-shows.js, updated weekly)
 let imdbIds = {};
@@ -23,7 +26,7 @@ try {
  * ═══════════════════════════════════════════════════ */
 const manifest = {
   id: "community.animefiller",
-  version: "1.2.1",
+  version: "1.2.2",
   name: "Anime Filler Checker",
   description:
     "Detects filler, canon, mixed, and anime-canon episodes for anime series. " +
@@ -112,6 +115,77 @@ function cacheHit(label) {
 function cacheMiss(label) {
   cacheStats.misses++;
   console.log(`[CACHE MISS] ${label} (hits=${cacheStats.hits} misses=${cacheStats.misses})`);
+}
+
+/**
+ * Pre-fetch name + absolute-episode mapping + filler data from KV in a single
+ * MGET command. Pre-populates the in-memory caches so the subsequent
+ * resolveAnimeName / resolveAbsoluteEpisode / fetchFillerData calls return
+ * instantly without extra KV reads.
+ *
+ * Only fetches whichever values are not already in memory. Kitsu IDs use
+ * absolute episode numbers natively, so the abep key is skipped for them.
+ *
+ * If `knownSlug` is provided (IMDB IDs that live in the local imdbIds map),
+ * the filler KV key is included in the same MGET — saving an additional
+ * KV command on the hot path.
+ *
+ * Counts as 1 Upstash command total — down from up to 3 separate GETs.
+ */
+async function prefetchSeriesData(seriesId, knownSlug) {
+  const isKitsu = seriesId.startsWith("kitsu:");
+  const kitsuId = isKitsu ? seriesId.slice("kitsu:".length) : null;
+
+  const memName = isKitsu ? kitsuNameCache.get(kitsuId) : cinemetaNameCache.get(seriesId);
+  const memAbep = isKitsu ? null : absoluteEpCache.get(seriesId);
+  const nameOk = memName && Date.now() - memName.ts < (isKitsu ? KITSU_NAME_CACHE_TTL : CINEMETA_NAME_CACHE_TTL);
+  // Kitsu doesn't need an abep mapping — treat as already satisfied so we
+  // never spend a KV slot on it.
+  const abepOk = isKitsu ? true : (memAbep && Date.now() - memAbep.ts < ABSOLUTE_EP_CACHE_TTL);
+  // Only batch the filler key when we know the slug AND the in-memory filler
+  // cache is stale/missing. On a hot serverless instance this skips the MGET
+  // entirely — the subsequent fetchFillerData() call hits in-memory for free.
+  const includeFiller = !!knownSlug && !hasFillerCacheFresh(knownSlug);
+
+  if (nameOk && abepOk && !includeFiller) return;
+
+  const safeId = seriesId.replace(/[^a-z0-9]/gi, "_");
+  const keys = [];
+  const slots = [];
+  if (!nameOk) {
+    keys.push(isKitsu ? `afc:name:kitsu:${safeId}` : `afc:name:cinemeta:${safeId}`);
+    slots.push("name");
+  }
+  if (!abepOk) {
+    keys.push(`afc:abep:${safeId}`);
+    slots.push("abep");
+  }
+  if (includeFiller) {
+    keys.push(fillerKvKey(knownSlug));
+    slots.push("filler");
+  }
+
+  if (!keys.length) return;
+
+  try {
+    const results = await kvMGet(keys);
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
+      const val = results[i];
+      if (slot === "name") {
+        if (val && typeof val === "string") {
+          if (isKitsu) kitsuNameCache.set(kitsuId, { name: val, ts: Date.now() });
+          else cinemetaNameCache.set(seriesId, { name: val, ts: Date.now() });
+        }
+      } else if (slot === "abep") {
+        if (val && typeof val === "object") {
+          absoluteEpCache.set(seriesId, { mapping: new Map(Object.entries(val)), ts: Date.now() });
+        }
+      } else if (slot === "filler") {
+        primeFillerCache(knownSlug, val);
+      }
+    }
+  } catch {}
 }
 
 async function resolveAnimeNameFromKitsu(kitsuId) {
@@ -297,6 +371,8 @@ builder.defineSubtitlesHandler(async ({ type, id, config }) => {
     if (!parsed) return { subtitles: [] };
 
     const seriesId = getSeriesId(id);
+    const knownSlug = seriesId.startsWith("tt") ? imdbIds[seriesId] : null;
+    await prefetchSeriesData(seriesId, knownSlug); // batch name+abep+filler in 1 MGET
 
     const animeName = await resolveAnimeName(seriesId);
     if (!animeName) return { subtitles: [] };
@@ -373,6 +449,9 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
     if (!parsed) return { streams: [] };
 
     const seriesId = getSeriesId(id);
+    const knownSlug = seriesId.startsWith("tt") ? imdbIds[seriesId] : null;
+    await prefetchSeriesData(seriesId, knownSlug); // batch name+abep+filler in 1 MGET
+
     const animeName = await resolveAnimeName(seriesId);
     if (!animeName) return { streams: [] };
 

@@ -43,6 +43,24 @@ async function kvGet(key) {
 }
 
 /**
+ * Get multiple values from KV in a single command (MGET).
+ * Returns an array of values in the same order as keys; null on miss or error.
+ * Counts as 1 Upstash command regardless of how many keys are requested.
+ * @param {string[]} keys
+ * @returns {Promise<Array<any|null>>}
+ */
+async function kvMGet(keys) {
+  const r = getRedis();
+  if (!r || !keys.length) return keys.map(() => null);
+  try {
+    return await r.mget(...keys);
+  } catch (e) {
+    console.error("[KV MGET ERROR]", keys, e.message);
+    return keys.map(() => null);
+  }
+}
+
+/**
  * Set a value in KV with a TTL.
  * @param {string} key
  * @param {any} value  – will be JSON-serialised by Upstash automatically
@@ -67,4 +85,4 @@ function kvAvailable() {
   return !!(url && token);
 }
 
-module.exports = { kvGet, kvSet, kvAvailable };
+module.exports = { kvGet, kvMGet, kvSet, kvAvailable };
