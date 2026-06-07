@@ -130,18 +130,6 @@ npm start`}</pre>
           </li>
         </ul>
 
-        <h2>Optional — Add Upstash Redis for caching</h2>
-        <p>
-          Not required for personal use, but if you want faster responses and lower function
-          invocation counts, create a free Upstash Redis database and add these env vars in Vercel:
-        </p>
-        <pre style={codeBlockStyle}>{`KV_REST_API_URL=<your upstash rest url>
-KV_REST_API_TOKEN=<your upstash rest token>`}</pre>
-        <p>
-          The addon will use it automatically — filler data is cached for 14 days and non-anime
-          lookups for 6 hours, so most requests never touch AnimeFillerList or Jikan.
-        </p>
-
         <h2>What about the public addon coming back?</h2>
         <p>
           No promises and no ETA. It will only come back if I find a hosting setup that can handle
